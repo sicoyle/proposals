@@ -77,7 +77,7 @@ or in this [release note agent](https://github.com/sicoyle/release-note-agent).
 - Runtime loading in `loadMCPServers()` during daprd startup, with hot-reload via Operator watch
 - Built-in `dapr.mcp.<mcpserver-name>.ListTools` and `dapr.mcp.<mcpserver-name>.CallTool` workflows defined and registered with daprd's wfengine using the `modelcontextprotocol/go-sdk`
     - This is a fundamental change that brings the idea of a Managed Workflow in essence into the runtime.
-- Built-in MCP authorization / per-tool RBAC — `middleware.beforeCall` / `middleware.afterCall` workflow hooks on `MCPServerSpec` provide extensibility points for custom authz workflows — user-registered workflows invoked before and after each `dapr.mcp.<mcpserver-name>.CallTool` (and `dapr.mcp.<mcpserver-name>.ListTools`) execution; `beforeCall` errors abort the call, `afterCall` errors are logged and the result is still returned (the MCP call already ran)
+- Built-in MCP middleware pipelines — `middleware.beforeCallTool` / `middleware.afterCallTool` / `middleware.beforeListTools` / `middleware.afterListTools` hook arrays on `MCPServerSpec` provide ordered extensibility points for custom workflows (RBAC, audit, sanitization, rate limiting). Each hook is an `MCPMiddlewareHook` containing a `workflow` (with optional `appID` for remote invocation). "before" hooks abort the chain on error; "after" hooks log errors without affecting the result
 - Transport support: `streamable_http`, `sse`, `stdio`
 
 > NOTE: I did choose the [official modelcontextprotocol go-sdk pkg](https://github.com/modelcontextprotocol/go-sdk); however, there is the [Mark3Labs alternative](https://github.com/mark3labs/mcp-go) which is more "popular" and established.
@@ -253,7 +253,7 @@ spec:
           value: EXAMPLE
 ```
 
-MCPServer with `beforeCall` authz and `afterCall` audit hooks:
+MCPServer with `beforeCallTool` authz and `afterCallTool` audit hook pipelines:
 
 ```yaml
 apiVersion: dapr.io/v1alpha1
@@ -310,10 +310,10 @@ Write every tool invocation and result to an immutable audit store. An
 writes an audit record. Errors in the audit workflow are logged but do not
 affect the result returned to the caller.
 
-**Input sanitization (beforeCallTool)**
-Strip or redact PII from tool arguments before they reach the MCP server. A
-`beforeCallTool` workflow inspects and modifies the arguments, then returns. If
-the sanitized arguments are invalid, the workflow returns an error to abort.
+**Input validation (beforeCallTool)**
+Reject tool arguments that contain disallowed PII or fail sanitization rules
+before they reach the MCP server. A `beforeCallTool` workflow inspects the
+arguments and returns an error to abort if validation fails.
 
 **Result enrichment (afterCallTool)**
 Annotate tool results with metadata such as latency, cost, or model version.
@@ -505,9 +505,9 @@ dapr.agents.<agent_name>.workflow (DurableAgent)
 dapr.agents.<agent_name>.workflow
   └─ ctx.call_child_workflow("dapr.mcp.<mcpserver-name>.CallTool", {mcp: "github-mcp", tool: "search_code", arguments: {...}})
        └─ [daprd built-in dapr.mcp.<mcpserver-name>.CallTool orchestration]
-            ├─ (if dapr.mcp.<mcpserver-name>.BeforeCall set)
-            │    ctx.call_child_workflow(dapr.mcp.<mcpserver-name>.BeforeCall, {mcpServer, tool, arguments})
-            │    → error returned? return CallToolResult{isError: true, content: [error]} to caller
+            ├─ for each hook in middleware.beforeCallTool:
+            │    ctx.call_child_workflow(hook.workflow.workflowName, {mcpServer, toolName, arguments})
+            │    → error returned? chain stops, return CallToolResult{isError: true, content: [error]}
             ├─ ctx.CallActivity("call-tool", input)
             │    └─ [daprd built-in activity]
             │         ├─ looks up MCPServer CRD from CompStore
@@ -515,14 +515,14 @@ dapr.agents.<agent_name>.workflow
             │         │    → auth failure (401/403, OAuth2 exchange, SPIFFE rejected)?
             │         │         return CallToolResult{isError: true, content: [error]} to caller
             │         └─ returns tool result
-            └─ (if dapr.mcp.<mcpserver-name>.AfterCall set)
-                 ctx.call_child_workflow(dapr.mcp.<mcpserver-name>.AfterCall, {mcpServer, tool, arguments, result})
-                 → error logged, result still returned to caller
+            └─ for each hook in middleware.afterCallTool:
+                 ctx.call_child_workflow(hook.workflow.workflowName, {mcpServer, toolName, arguments, result})
+                 → errors logged, result still returned to caller
 ```
 
 #### Error propagation contract
 
-All auth/identity errors — whether from `beforeCall` middleware or from the transport layer (OAuth2 token exchange failure, 401/403 from the MCP server, SPIFFE JWT rejection) — **are returned as `CallToolResult{isError: true}`**, not as a workflow execution failure.
+All auth/identity errors — whether from `beforeCallTool` middleware hooks or from the transport layer (OAuth2 token exchange failure, 401/403 from the MCP server, SPIFFE JWT rejection) — **are returned as `CallToolResult{isError: true}`**, not as a workflow execution failure.
 
 This is required so the calling agent's execution loop receives a structured tool error it can forward to the LLM. The LLM can then reason about the denial (e.g. missing scope, wrong identity) and decide to retry with different parameters, request elevation, or surface the error to the user. A workflow termination status of `FAILED` would instead halt the agent loop.
 
@@ -532,7 +532,7 @@ The `content` field of the error result should carry a human-readable descriptio
 {
   "isError": true,
   "content": [
-    { "type": "text", "text": "identity denied: agent 'my-agent' is not permitted to call tool 'payments.refund' (beforeCall: payments-authz-workflow)" }
+    { "type": "text", "text": "identity denied: agent 'my-agent' is not permitted to call tool 'payments.refund' (beforeCallTool: payments-authz-workflow)" }
   ]
 }
 ```
@@ -656,7 +656,7 @@ if isinstance(tool_obj, WorkflowContextInjectedTool):
 - [ ] Processor: `pkg/runtime/processor/mcp.go` — `AddPendingMCPServer`, `processMCPServers`; extend `processor.go` with channel and goroutine
 - [ ] Operator API: `pkg/operator/api/mcp.go` — List, Get, streaming Watch; wire informer in `api.go`
 - [ ] Runtime: `loadMCPServers()`, `flushOutstandingMCPServers()`, hot-reload watch subscription in `pkg/runtime/runtime.go`
-- [ ] Built-in MCP worker: `pkg/runtime/mcp/worker.go`, `transport.go`, `types.go` — `dapr.mcp.<mcpserver-name>.ListTools` + `dapr.mcp.<mcpserver-name>.CallTool` orchestrations and activities using `modelcontextprotocol/go-sdk`; include `beforeCall`/`afterCall` middleware hook invocations in both orchestrations with the abort-on-error / log-and-continue semantics described above
+- [ ] Built-in MCP worker: `pkg/runtime/mcp/worker.go`, `transport.go`, `types.go` — `dapr.mcp.<mcpserver-name>.ListTools` + `dapr.mcp.<mcpserver-name>.CallTool` orchestrations and activities using `modelcontextprotocol/go-sdk`; include `beforeCallTool`/`afterCallTool`/`beforeListTools`/`afterListTools` middleware hook pipelines executed in array order with abort-on-error (before) / log-and-continue (after) semantics
 - [ ] WFEngine activation: extend wfengine startup condition so that the presence of any loaded MCPServer manifest also triggers the workflow runtime (in addition to the existing workflow-client-connected trigger) — `pkg/runtime/runtime.go`
 - [ ] Workflow router: add a router on the sidecar-side workflow client that dispatches `dapr.mcp.*` workflow names to the built-in MCP worker and all other names to the user app's registered worker — `pkg/runtime/wfengine/` or `pkg/runtime/wfruntime/`
 - [ ] WFEngine integration: start built-in MCP worker in `pkg/runtime/wfengine/wfengine.go`
